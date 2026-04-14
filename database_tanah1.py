@@ -1,818 +1,861 @@
-import pandas as pd
+"""
+scraper_properti.py — Prototipe Web Scraper Properti
+Sumber  : rumah123.com (halaman listing tanah)
+Deploy  : Streamlit Cloud (GitHub)
+Versi   : 1.1 — Fix ModuleNotFoundError httpx
+
+Strategi parsing:
+  Rumah123 adalah Next.js app. Data listing tersimpan di tag <script id="__NEXT_DATA__">
+  dalam format JSON — jauh lebih andal dari CSS selector yang bisa berubah kapan saja.
+  Pendekatan: requests (request ringan) → BeautifulSoup cari __NEXT_DATA__ → parse JSON.
+
+Dependencies (requirements.txt) — WAJIB ada di root repo GitHub:
+  streamlit>=1.28.0
+  requests>=2.31.0
+  beautifulsoup4>=4.12.0
+  lxml>=4.9.0
+  pandas>=2.0.0
+  openpyxl>=3.1.0
+  xlrd>=2.0.0
+"""
+
 import streamlit as st
-import folium
-from streamlit_folium import st_folium
-import math
+import json
+import re
+import time
+import random
+import pandas as pd
+import io
+from datetime import datetime
+from bs4 import BeautifulSoup
+
+# HTTP client — requests adalah standar universal, pasti tersedia di semua environment.
+# Tidak menggunakan httpx karena sering gagal resolve di Streamlit Cloud akibat
+# dependency conflict dengan versi streamlit yang sudah terinstall.
+try:
+    import requests as _http_lib
+    _HTTP_BACKEND = "requests"
+except ImportError:
+    _http_lib = None
+    _HTTP_BACKEND = "none"
 
 # ==========================================
-# KONFIGURASI HALAMAN
+# KONFIGURASI
 # ==========================================
-st.set_page_config(
-    page_title="Pangkalan Data Tanah — KJPP",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'About': "Pangkalan Data Tanah v2 — KJPP Suwendho Rinaldy dan Rekan"
-    }
-)
 
-# ==========================================
-# CUSTOM CSS — TEMA PROFESIONAL
-# ==========================================
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Lora:ital,wght@0,400;0,600;1,400&display=swap');
+BASE_URL = "https://www.rumah123.com"
 
-html, body, [class*="css"] {
-    font-family: 'Plus Jakarta Sans', sans-serif;
+# Pola URL pencarian tanah per kota
+# Format: /jual/{slug-kota}/tanah/?page={n}
+# Kecamatan ditambahkan via parameter ?keyword=
+URL_TEMPLATE = "{base}/jual/{kota_slug}/tanah/"
+
+# Daftar kota beserta slug URL-nya
+# Slug bisa dicek dari URL di browser saat browsing rumah123
+KOTA_SLUG = {
+    "Bandung":          "bandung",
+    "Kab. Bandung":     "kabupaten-bandung",
+    "Jakarta Selatan":  "jakarta-selatan",
+    "Jakarta Barat":    "jakarta-barat",
+    "Jakarta Timur":    "jakarta-timur",
+    "Jakarta Utara":    "jakarta-utara",
+    "Jakarta Pusat":    "jakarta-pusat",
+    "Surabaya":         "surabaya",
+    "Semarang":         "semarang",
+    "Yogyakarta":       "yogyakarta",
+    "Medan":            "medan",
+    "Makassar":         "makassar",
+    "Depok":            "depok",
+    "Bekasi":           "bekasi",
+    "Tangerang":        "tangerang",
+    "Bogor":            "bogor",
+    "Malang":           "malang",
+    "Palembang":        "palembang",
+    "Balikpapan":       "balikpapan",
+    "Denpasar":         "denpasar",
 }
 
-/* ---- Sidebar ---- */
+# Header HTTP — menyerupai browser biasa untuk menghindari blokir awal
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.google.com/",
+}
+
+# Kolom output — didesain kompatibel dengan Pangkalandata8
+KOLOM_OUTPUT = [
+    "Timestamp", "Nomor", "Tahun", "URL_Sumber",
+    "Judul_Iklan", "Alamat", "Kecamatan", "Kota", "Propinsi",
+    "Luas_Tanah", "Luas_Bangunan",
+    "Harga_Total", "Harga_Tanah",
+    "Peruntukan", "Bukti_Kepemilikan",
+    "Latitude", "Longitude",
+    "Kontak", "Agen",
+    "Foto_URL", "Deskripsi",
+]
+
+# ==========================================
+# HELPER: PARSING HARGA
+# ==========================================
+
+def parse_harga(text):
+    """
+    Mengkonversi string harga rumah123 ke integer.
+    Contoh input: 'Rp 1,5 Miliar', 'Rp 500 Juta', 'Rp 750.000.000'
+    """
+    if not text:
+        return 0
+    text = str(text).lower().strip()
+    text = text.replace("rp", "").replace(" ", "").strip()
+    try:
+        if "miliar" in text or "m" == text[-1]:
+            angka = float(re.sub(r"[^0-9,.]", "", text).replace(",", "."))
+            return int(angka * 1_000_000_000)
+        elif "juta" in text:
+            angka = float(re.sub(r"[^0-9,.]", "", text).replace(",", "."))
+            return int(angka * 1_000_000)
+        else:
+            clean = re.sub(r"[^0-9]", "", text)
+            return int(clean) if clean else 0
+    except Exception:
+        return 0
+
+
+def parse_luas(text):
+    """
+    Mengambil angka luas dari string seperti 'LT: 250 m²' atau '250 m²'.
+    """
+    if not text:
+        return 0
+    try:
+        numbers = re.findall(r"[\d,.]+", str(text))
+        if numbers:
+            return float(numbers[0].replace(",", "."))
+    except Exception:
+        pass
+    return 0
+
+
+def hitung_harga_per_m2(harga_total, luas_tanah):
+    """Hitung indikasi harga per m²."""
+    try:
+        if luas_tanah and luas_tanah > 0:
+            return round(harga_total / luas_tanah)
+    except Exception:
+        pass
+    return 0
+
+
+# ==========================================
+# CORE: FETCH HALAMAN
+# ==========================================
+
+def fetch_page(url, timeout=20):
+    """
+    Mengambil HTML halaman dengan requests (library standar Python).
+    Mengembalikan (html_text, 200) jika berhasil, atau (None, pesan_error).
+
+    Menggunakan requests bukan httpx karena:
+    - requests sudah pasti ada di semua Python environment termasuk Streamlit Cloud
+    - httpx sering mengalami dependency conflict saat di-install bersama streamlit
+    - Untuk scraping halaman statis, requests sudah lebih dari cukup
+    """
+    if _http_lib is None:
+        return None, "Library HTTP tidak tersedia — pastikan 'requests' ada di requirements.txt"
+
+    try:
+        session = _http_lib.Session()
+        session.headers.update(HEADERS)
+
+        # Tambahkan cookie consent standar agar tidak di-redirect
+        session.cookies.set("consent", "true", domain=".rumah123.com")
+
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+
+        if resp.status_code == 200:
+            return resp.text, 200
+        elif resp.status_code == 403:
+            return None, "403 — Akses ditolak (rate limit atau blokir IP sementara)"
+        elif resp.status_code == 404:
+            return None, "404 — Halaman tidak ditemukan, cek slug kota"
+        elif resp.status_code == 429:
+            return None, "429 — Terlalu banyak request, tambah jeda dan coba lagi"
+        else:
+            return None, f"HTTP {resp.status_code} — {resp.reason}"
+
+    except _http_lib.exceptions.Timeout:
+        return None, "Timeout — koneksi terlalu lambat, coba lagi"
+    except _http_lib.exceptions.ConnectionError:
+        return None, "Connection error — tidak bisa terhubung ke rumah123.com"
+    except Exception as e:
+        return None, f"Error tidak terduga: {str(e)}"
+
+
+# ==========================================
+# CORE: EKSTRAK DATA DARI __NEXT_DATA__
+# ==========================================
+
+def extract_next_data(html):
+    """
+    Mengambil JSON dari tag <script id="__NEXT_DATA__">.
+    Ini pendekatan paling andal untuk Next.js sites karena:
+    - Data sudah terstruktur (tidak perlu parsing HTML fragile)
+    - Tidak terpengaruh perubahan CSS class
+    - Tersedia selama rumah123 menggunakan Next.js (sudah bertahun-tahun)
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not tag or not tag.string:
+        return None
+    try:
+        return json.loads(tag.string)
+    except json.JSONDecodeError:
+        return None
+
+
+def find_listings_in_json(data, depth=0, max_depth=8):
+    """
+    Rekursif mencari array listing di dalam struktur JSON Next.js.
+    Rumah123 menyimpan listings di path yang bisa berubah antar halaman,
+    sehingga pendekatan rekursif lebih tahan perubahan struktur.
+
+    Indikator array listing: list berisi dict yang memiliki key 'price' atau 'id'
+    dengan panjang > 0.
+    """
+    if depth > max_depth or data is None:
+        return None
+
+    if isinstance(data, list) and len(data) > 0:
+        # Cek apakah ini array listing berdasarkan key yang ada
+        sample = data[0] if data else {}
+        if isinstance(sample, dict):
+            keys = set(sample.keys())
+            # Signature key listing rumah123
+            listing_keys = {"price", "title", "id", "address", "attributes"}
+            if len(listing_keys & keys) >= 2:
+                return data
+
+    if isinstance(data, dict):
+        # Prioritas: cek key yang kemungkinan besar berisi listings
+        priority_keys = ["listings", "properties", "data", "results",
+                         "pageProps", "initialData", "listingData"]
+        for key in priority_keys:
+            if key in data:
+                result = find_listings_in_json(data[key], depth + 1, max_depth)
+                if result:
+                    return result
+        # Fallback: cek semua key
+        for key, val in data.items():
+            if key not in priority_keys:
+                result = find_listings_in_json(val, depth + 1, max_depth)
+                if result:
+                    return result
+
+    return None
+
+
+def parse_single_listing(item, kota_filter, idx):
+    """
+    Memetakan satu dict listing dari JSON ke format kolom Pangkalandata.
+    Menggunakan .get() di semua level agar tidak crash jika field tidak ada.
+    """
+    try:
+        # --- ID dan URL ---
+        listing_id = item.get("id", "")
+        url_path   = item.get("url", "") or item.get("shareUrl", "")
+        if url_path and not url_path.startswith("http"):
+            url_path = BASE_URL + url_path
+        if not url_path and listing_id:
+            url_path = f"{BASE_URL}/properti/{listing_id}.html"
+
+        # --- Judul ---
+        judul = item.get("title", "") or item.get("name", "")
+
+        # --- Harga ---
+        price_raw = item.get("price", {})
+        if isinstance(price_raw, dict):
+            harga_text = price_raw.get("text", "") or str(price_raw.get("value", 0))
+        else:
+            harga_text = str(price_raw)
+        harga_total = parse_harga(harga_text)
+
+        # --- Atribut properti (luas, sertifikat, dll) ---
+        attrs = item.get("attributes", {}) or {}
+        if isinstance(attrs, list):
+            # Beberapa versi menyimpan sebagai list of {label, value}
+            attrs_dict = {a.get("label", "").lower(): a.get("value", "") for a in attrs}
+        else:
+            attrs_dict = {k.lower(): v for k, v in attrs.items()}
+
+        # Luas tanah
+        luas_tnh_raw = (
+            attrs_dict.get("land size", 0) or
+            attrs_dict.get("landsize", 0) or
+            attrs_dict.get("luas tanah", 0) or
+            item.get("landSize", 0) or
+            item.get("land_size", 0)
+        )
+        luas_tanah = parse_luas(luas_tnh_raw)
+
+        # Luas bangunan
+        luas_bgn_raw = (
+            attrs_dict.get("building size", 0) or
+            attrs_dict.get("buildingsize", 0) or
+            attrs_dict.get("luas bangunan", 0) or
+            item.get("buildingSize", 0) or
+            item.get("building_size", 0)
+        )
+        luas_bgn = parse_luas(luas_bgn_raw)
+
+        # Sertifikat / legalitas
+        sertifikat = (
+            attrs_dict.get("certificate", "") or
+            attrs_dict.get("sertifikat", "") or
+            attrs_dict.get("ownership", "") or
+            item.get("certificate", "")
+        )
+
+        # --- Lokasi ---
+        address = item.get("address", {}) or {}
+        if isinstance(address, str):
+            alamat_str  = address
+            kecamatan   = ""
+            kota_str    = kota_filter
+            propinsi    = ""
+        else:
+            alamat_str  = address.get("street", "") or address.get("text", "")
+            kecamatan   = address.get("district", "") or address.get("subdistrict", "")
+            kota_str    = address.get("city", "") or kota_filter
+            propinsi    = address.get("province", "") or address.get("state", "")
+
+        # Fallback: kadang lokasi ada di key terpisah
+        if not kota_str:
+            kota_str = item.get("city", "") or kota_filter
+        if not kecamatan:
+            kecamatan = item.get("district", "")
+
+        # --- Koordinat ---
+        coordinate = item.get("coordinate", {}) or item.get("location", {}) or {}
+        if isinstance(coordinate, dict):
+            lat = coordinate.get("latitude", coordinate.get("lat", None))
+            lon = coordinate.get("longitude", coordinate.get("lng", coordinate.get("lon", None)))
+        else:
+            lat, lon = None, None
+
+        # --- Kontak & Agen ---
+        agent = item.get("agent", {}) or item.get("contact", {}) or {}
+        if isinstance(agent, dict):
+            nama_agen = agent.get("name", "") or agent.get("fullName", "")
+            telp_agen = agent.get("phone", "") or agent.get("phoneNumber", "")
+        else:
+            nama_agen = str(agent)
+            telp_agen = ""
+
+        # --- Foto ---
+        photos = item.get("photos", []) or item.get("images", []) or []
+        foto_url = ""
+        if photos and isinstance(photos, list):
+            first = photos[0]
+            if isinstance(first, dict):
+                foto_url = first.get("url", first.get("mediaUrl", first.get("src", "")))
+            elif isinstance(first, str):
+                foto_url = first
+
+        # --- Deskripsi ---
+        deskripsi = item.get("description", "") or item.get("shortDescription", "")
+        if deskripsi:
+            deskripsi = deskripsi[:300]  # Batasi panjang
+
+        # --- Harga per m² ---
+        harga_per_m2 = hitung_harga_per_m2(harga_total, luas_tanah)
+
+        # --- Tahun dari tanggal listing ---
+        listed_at = item.get("listingDate", "") or item.get("createdAt", "")
+        try:
+            tahun = int(str(listed_at)[:4]) if listed_at else datetime.now().year
+            if tahun < 2000 or tahun > 2030:
+                tahun = datetime.now().year
+        except Exception:
+            tahun = datetime.now().year
+
+        # --- Nomor unik ---
+        nomor = f"R123-{str(listing_id)[:8] or str(idx).zfill(4)}"
+
+        return {
+            "Timestamp":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Nomor":            nomor,
+            "Tahun":            tahun,
+            "URL_Sumber":       url_path,
+            "Judul_Iklan":      str(judul).strip(),
+            "Alamat":           str(alamat_str).strip(),
+            "Kecamatan":        str(kecamatan).strip(),
+            "Kota":             str(kota_str).strip(),
+            "Propinsi":         str(propinsi).strip(),
+            "Luas_Tanah":       luas_tanah,
+            "Luas_Bangunan":    luas_bgn,
+            "Harga_Total":      harga_total,
+            "Harga_Tanah":      harga_per_m2,
+            "Peruntukan":       "",
+            "Bukti_Kepemilikan": str(sertifikat).strip(),
+            "Latitude":         lat,
+            "Longitude":        lon,
+            "Kontak":           str(telp_agen).strip(),
+            "Agen":             str(nama_agen).strip(),
+            "Foto_URL":         str(foto_url).strip(),
+            "Deskripsi":        str(deskripsi).strip(),
+        }
+
+    except Exception as e:
+        return None
+
+
+# ==========================================
+# CORE: SCRAPE SATU HALAMAN
+# ==========================================
+
+def scrape_satu_halaman(kota_nama, kecamatan_filter="", page=1, delay_min=3, delay_max=7):
+    """
+    Mengambil data listing dari satu halaman pencarian.
+    Mengembalikan (list_records, status_msg, raw_debug).
+
+    delay_min/max: jeda detik sebelum request (rate limiting).
+    """
+    slug = KOTA_SLUG.get(kota_nama, kota_nama.lower().replace(" ", "-"))
+    url  = URL_TEMPLATE.format(base=BASE_URL, kota_slug=slug)
+
+    params = {"page": page}
+    if kecamatan_filter.strip():
+        params["keyword"] = kecamatan_filter.strip()
+
+    # Bangun URL dengan parameter
+    param_str = "&".join(f"{k}={v}" for k, v in params.items())
+    full_url  = f"{url}?{param_str}"
+
+    # Jeda sebelum request
+    if delay_min > 0:
+        jeda = random.uniform(delay_min, delay_max)
+        time.sleep(jeda)
+
+    html, status = fetch_page(full_url)
+
+    if html is None:
+        return [], f"Gagal fetch: {status}", {"url": full_url, "error": status}
+
+    # Parse __NEXT_DATA__
+    next_data = extract_next_data(html)
+    if next_data is None:
+        # Fallback: cek apakah ada JSON inline lain
+        debug = {
+            "url": full_url,
+            "html_length": len(html),
+            "has_next_data": False,
+            "note": (
+                "__NEXT_DATA__ tidak ditemukan. Kemungkinan: "
+                "(1) halaman di-render via CSR bukan SSR — perlu Playwright, "
+                "(2) struktur halaman berubah, "
+                "(3) IP diblokir sementara."
+            )
+        }
+        return [], "Parsing gagal: __NEXT_DATA__ tidak ditemukan", debug
+
+    listings_raw = find_listings_in_json(next_data)
+    debug = {
+        "url": full_url,
+        "html_length": len(html),
+        "has_next_data": True,
+        "listings_found": len(listings_raw) if listings_raw else 0,
+        "next_data_keys": list(next_data.keys()) if isinstance(next_data, dict) else [],
+    }
+
+    if not listings_raw:
+        debug["note"] = (
+            "__NEXT_DATA__ ada tapi listings tidak ditemukan. "
+            "Kemungkinan struktur JSON berubah. "
+            "Cek debug_json untuk inspeksi manual."
+        )
+        # Simpan sampel JSON untuk debugging
+        debug["sample_json"] = str(next_data)[:2000]
+        return [], "Parsing gagal: listing tidak ditemukan di JSON", debug
+
+    records = []
+    for idx, item in enumerate(listings_raw):
+        parsed = parse_single_listing(item, kota_nama, idx + 1)
+        if parsed and parsed.get("Luas_Tanah", 0) > 0:
+            records.append(parsed)
+
+    status_msg = f"OK — {len(records)} listing valid dari {len(listings_raw)} item JSON"
+    return records, status_msg, debug
+
+
+# ==========================================
+# DEDUPLICATION
+# ==========================================
+
+def cek_dan_hapus_duplikat(df_baru, df_existing):
+    """
+    Menghapus baris di df_baru yang URL_Sumber-nya sudah ada di df_existing.
+    Menggunakan URL_Sumber sebagai kunci karena ID listing rumah123 bersifat permanen.
+    """
+    if df_existing.empty or "URL_Sumber" not in df_existing.columns:
+        return df_baru, 0
+
+    existing_urls = set(df_existing["URL_Sumber"].dropna().str.strip())
+    mask_baru     = ~df_baru["URL_Sumber"].str.strip().isin(existing_urls)
+    df_filtered   = df_baru[mask_baru].copy()
+    jumlah_duplikat = len(df_baru) - len(df_filtered)
+
+    return df_filtered, jumlah_duplikat
+
+
+def to_excel_bytes(df):
+    """Konversi DataFrame ke bytes Excel untuk st.download_button."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data Scraping")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ==========================================
+# STREAMLIT UI
+# ==========================================
+
+st.set_page_config(
+    page_title="Scraper Properti — KJPP",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Lora:wght@600&display=swap');
+
+html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif; }
+
 [data-testid="stSidebar"] {
     background: #0f1923;
     border-right: 1px solid #1e2d3d;
 }
-[data-testid="stSidebar"] * {
-    color: #c8d8e8 !important;
-}
-[data-testid="stSidebar"] .stSelectbox label,
-[data-testid="stSidebar"] .stFileUploader label,
-[data-testid="stSidebar"] .stTextInput label {
-    color: #7a9ab5 !important;
-    font-size: 0.75rem !important;
-    letter-spacing: 0.08em !important;
-    text-transform: uppercase !important;
-    font-weight: 600 !important;
-}
-[data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div {
-    background: #1a2838 !important;
-    border: 1px solid #2a3f55 !important;
-    border-radius: 8px !important;
-    color: #c8d8e8 !important;
-}
-[data-testid="stSidebar"] hr {
-    border-color: #1e2d3d !important;
-}
+[data-testid="stSidebar"] * { color: #c8d8e8 !important; }
+[data-testid="stSidebar"] hr { border-color: #1e2d3d !important; }
 
-/* ---- Tombol Utama ---- */
 div.stButton > button[kind="primary"] {
     background: linear-gradient(135deg, #1a6b4a 0%, #0d4a32 100%);
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    font-family: 'Plus Jakarta Sans', sans-serif !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.04em !important;
-    padding: 0.6rem 1.5rem !important;
+    color: white !important; border: none !important;
+    border-radius: 10px !important; font-weight: 600 !important;
+    width: 100% !important; padding: 0.6rem 1.5rem !important;
     transition: all 0.2s ease !important;
-    width: 100% !important;
 }
 div.stButton > button[kind="primary"]:hover {
     transform: translateY(-1px) !important;
-    box-shadow: 0 6px 20px rgba(26, 107, 74, 0.4) !important;
+    box-shadow: 0 6px 20px rgba(26,107,74,0.4) !important;
 }
 
-/* ---- Header Area ---- */
-.main-header {
+.page-header {
     background: linear-gradient(135deg, #0f1923 0%, #1a2e42 50%, #0f1923 100%);
-    border-radius: 16px;
-    padding: 2rem 2.5rem;
-    margin-bottom: 1.5rem;
+    border-radius: 16px; padding: 1.8rem 2.2rem; margin-bottom: 1.5rem;
     border: 1px solid #1e3348;
-    position: relative;
-    overflow: hidden;
 }
-.main-header::before {
-    content: '';
-    position: absolute;
-    top: -50%;
-    right: -10%;
-    width: 300px;
-    height: 300px;
-    background: radial-gradient(circle, rgba(26,107,74,0.15) 0%, transparent 70%);
-    pointer-events: none;
+.page-header h1 {
+    font-family: 'Lora', serif !important; font-size: 1.7rem !important;
+    color: #e8f4f0 !important; margin: 0 !important;
 }
-.main-header h1 {
-    font-family: 'Lora', serif !important;
-    font-size: 1.9rem !important;
-    font-weight: 600 !important;
-    color: #e8f4f0 !important;
-    margin: 0 !important;
-    letter-spacing: -0.01em !important;
+.page-header p { color: #7a9ab5 !important; font-size: 0.82rem !important; margin: 0.3rem 0 0 !important; }
+.badge {
+    display: inline-block; background: rgba(26,107,74,0.2);
+    border: 1px solid rgba(26,107,74,0.4); color: #4ecb8d !important;
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; padding: 2px 9px; border-radius: 20px; margin-bottom: 0.7rem;
 }
-.main-header p {
-    color: #7a9ab5 !important;
-    font-size: 0.85rem !important;
-    margin: 0.4rem 0 0 0 !important;
-    letter-spacing: 0.04em !important;
+.stat-row {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 12px; margin-bottom: 1.2rem;
 }
-.header-badge {
-    display: inline-block;
-    background: rgba(26,107,74,0.2);
-    border: 1px solid rgba(26,107,74,0.4);
-    color: #4ecb8d !important;
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    padding: 3px 10px;
-    border-radius: 20px;
-    margin-bottom: 0.8rem;
+.stat-box {
+    background: #fff; border: 1px solid #e8ecf0;
+    border-radius: 12px; padding: 1rem 1.2rem;
 }
-
-/* ---- Metric Cards ---- */
-.metric-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 14px;
-    margin-bottom: 1.5rem;
+.stat-box .lbl { font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: #8a97a5; margin-bottom: 0.3rem; }
+.stat-box .val { font-size: 1.4rem; font-weight: 700; color: #1a2535; }
+.stat-box .sub { font-size: 0.7rem; color: #9aabb8; margin-top: 0.1rem; }
+.stat-box.g::after { content:''; display:block; height:3px; margin-top:0.8rem;
+    border-radius:2px; background:linear-gradient(90deg,#1a6b4a,#4ecb8d); }
+.stat-box.b::after { content:''; display:block; height:3px; margin-top:0.8rem;
+    border-radius:2px; background:linear-gradient(90deg,#1a5c8b,#4eaacb); }
+.stat-box.a::after { content:''; display:block; height:3px; margin-top:0.8rem;
+    border-radius:2px; background:linear-gradient(90deg,#9b6b1a,#cbaa4e); }
+.stat-box.r::after { content:''; display:block; height:3px; margin-top:0.8rem;
+    border-radius:2px; background:linear-gradient(90deg,#8b3a1a,#cb6e4e); }
+.warn-box {
+    background: #fffbeb; border: 1px solid #f6d860;
+    border-radius: 10px; padding: 0.9rem 1.1rem;
+    font-size: 0.8rem; color: #7a5c0a; margin-bottom: 1rem;
 }
-.metric-card {
-    background: #ffffff;
-    border: 1px solid #e8ecf0;
-    border-radius: 12px;
-    padding: 1.1rem 1.3rem;
-    position: relative;
-    overflow: hidden;
-    transition: box-shadow 0.2s ease;
+.ok-box {
+    background: #f0f9f5; border: 1px solid #a8dfca;
+    border-radius: 10px; padding: 0.9rem 1.1rem;
+    font-size: 0.8rem; color: #1a6b4a; margin-bottom: 1rem;
 }
-.metric-card:hover {
-    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-}
-.metric-card::after {
-    content: '';
-    position: absolute;
-    bottom: 0; left: 0;
-    width: 100%; height: 3px;
-}
-.metric-card.green::after  { background: linear-gradient(90deg, #1a6b4a, #4ecb8d); }
-.metric-card.blue::after   { background: linear-gradient(90deg, #1a5c8b, #4eaacb); }
-.metric-card.amber::after  { background: linear-gradient(90deg, #9b6b1a, #cbaa4e); }
-.metric-card.coral::after  { background: linear-gradient(90deg, #8b3a1a, #cb6e4e); }
-.metric-label {
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: #8a97a5;
-    margin-bottom: 0.4rem;
-}
-.metric-value {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: #1a2535;
-    line-height: 1.2;
-}
-.metric-sub {
-    font-size: 0.72rem;
-    color: #9aabb8;
-    margin-top: 0.2rem;
-}
-
-/* ---- Stat Cards (Tab Statistik) ---- */
-.stat-section-title {
-    font-family: 'Lora', serif;
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: #1a2535;
-    margin: 1.5rem 0 0.8rem 0;
-    padding-bottom: 0.5rem;
-    border-bottom: 2px solid #e8ecf0;
-}
-.stat-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
-    margin-bottom: 1.2rem;
-}
-.stat-card {
-    background: #fff;
-    border: 1px solid #e8ecf0;
-    border-radius: 14px;
-    padding: 1.4rem 1.5rem;
-    text-align: center;
-}
-.stat-icon {
-    font-size: 1.5rem;
-    margin-bottom: 0.5rem;
-}
-.stat-label {
-    font-size: 0.72rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #8a97a5;
-    margin-bottom: 0.6rem;
-}
-.stat-value {
-    font-family: 'Lora', serif;
-    font-size: 1.4rem;
-    font-weight: 600;
-    color: #1a2535;
-    margin-bottom: 0.2rem;
-}
-.stat-value.green { color: #1a6b4a; }
-.stat-value.coral { color: #a03a1a; }
-.stat-value.blue  { color: #1a5c8b; }
-.stat-sub {
-    font-size: 0.72rem;
-    color: #9aabb8;
-}
-
-/* ---- Bar Chart Horisontal ---- */
-.bar-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 10px;
-}
-.bar-label {
-    font-size: 0.78rem;
-    color: #4a5568;
-    min-width: 130px;
-    text-align: right;
-    font-weight: 500;
-}
-.bar-track {
-    flex: 1;
-    height: 10px;
-    background: #f0f4f8;
-    border-radius: 5px;
-    overflow: hidden;
-}
-.bar-fill {
-    height: 100%;
-    border-radius: 5px;
-    background: linear-gradient(90deg, #1a6b4a, #4ecb8d);
-    transition: width 0.5s ease;
-}
-.bar-val {
-    font-size: 0.75rem;
-    color: #4a5568;
-    min-width: 110px;
-    font-weight: 600;
-}
-
-/* ---- Result Badge ---- */
-.result-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: #f0f9f5;
-    border: 1px solid #a8dfca;
-    color: #1a6b4a;
-    font-size: 0.8rem;
-    font-weight: 600;
-    padding: 5px 14px;
-    border-radius: 20px;
-    margin-bottom: 1rem;
-}
-
-/* ---- Tabs ---- */
-div[data-baseweb="tab-list"] {
-    gap: 0 !important;
-    border-bottom: 2px solid #e8ecf0 !important;
-    background: transparent !important;
-}
-div[data-baseweb="tab"] {
-    font-family: 'Plus Jakarta Sans', sans-serif !important;
-    font-size: 0.82rem !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.04em !important;
-    padding: 0.6rem 1.2rem !important;
-    color: #8a97a5 !important;
-    border-radius: 0 !important;
-}
-div[data-baseweb="tab"][aria-selected="true"] {
-    color: #1a6b4a !important;
-    border-bottom: 2px solid #1a6b4a !important;
-    background: transparent !important;
-}
-
-/* ---- Tabel ---- */
-[data-testid="stDataFrame"] {
-    border: 1px solid #e8ecf0 !important;
-    border-radius: 12px !important;
-    overflow: hidden !important;
-}
-
-/* ---- Info/Warning Box ---- */
-[data-testid="stAlert"] {
-    border-radius: 10px !important;
-}
-
-/* ---- Scrollbar ---- */
-::-webkit-scrollbar { width: 5px; height: 5px; }
-::-webkit-scrollbar-track { background: #f0f4f8; }
-::-webkit-scrollbar-thumb { background: #c0d0dc; border-radius: 3px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
-def generate_streetview_url(lat, lon):
-    return f"https://maps.google.com/maps?q=&layer=c&cbll={lat},{lon}"
-
-@st.cache_data(show_spinner=False)
-def load_data(file_bytes, file_name):
-    """Cache berdasarkan konten file (bukan referensi objek)"""
-    import io
-    df = pd.read_excel(io.BytesIO(file_bytes))
-
-    required_columns = ["Latitude", "Longitude", "Kota", "Tahun", "Nomor", "Harga_Tanah"]
-    missing_cols = [col for col in required_columns if col not in df.columns]
-    if missing_cols:
-        st.error(f"❌ Kolom tidak ditemukan: **{', '.join(missing_cols)}**  \nPastikan file dihasilkan dari agregatordata v2.")
-        st.stop()
-
-    df["Latitude"]   = pd.to_numeric(df["Latitude"],   errors="coerce")
-    df["Longitude"]  = pd.to_numeric(df["Longitude"],  errors="coerce")
-    df["Harga_Tanah"] = pd.to_numeric(df["Harga_Tanah"], errors="coerce")
-    return df
-
-def format_currency(value):
-    try:
-        return f"Rp {float(value):,.0f}".replace(",", ".")
-    except (ValueError, TypeError):
-        return "Rp 0"
-
-def format_currency_short(value):
-    try:
-        v = float(value)
-        if v >= 1_000_000_000:
-            return f"Rp {v/1_000_000_000:.2f} M"
-        elif v >= 1_000_000:
-            return f"Rp {v/1_000_000:.1f} jt"
-        else:
-            return f"Rp {v:,.0f}".replace(",", ".")
-    except Exception:
-        return "Rp 0"
-
-def bersihkan_tahun(val):
-    try:
-        return pd.to_numeric(str(val).replace(",", "").strip(), errors="coerce", downcast="integer")
-    except Exception:
-        return None
-
-def get_color_by_year(year):
-    try:
-        year = int(year)
-        if year >= 2025: return "green"
-        elif year >= 2024: return "blue"
-        elif year >= 2023: return "orange"
-        else: return "red"
-    except Exception:
-        return "gray"
-
-def build_bar_chart_html(data_series, label_col, value_col, max_val=None):
-    """Membuat bar chart horizontal sederhana dalam HTML"""
-    html = ""
-    if data_series.empty:
-        return "<p style='color:#9aabb8;font-size:0.8rem'>Tidak ada data</p>"
-    if max_val is None:
-        max_val = data_series[value_col].max()
-    if max_val == 0:
-        max_val = 1
-    for _, row in data_series.iterrows():
-        pct = (row[value_col] / max_val) * 100
-        lbl = str(row[label_col])[:20]
-        val_str = format_currency_short(row[value_col])
-        html += f"""
-        <div class="bar-row">
-            <span class="bar-label">{lbl}</span>
-            <div class="bar-track"><div class="bar-fill" style="width:{pct:.1f}%"></div></div>
-            <span class="bar-val">{val_str}/m²</span>
-        </div>"""
-    return html
-
-# ==========================================
-# SIDEBAR
-# ==========================================
+# --- SIDEBAR ---
 with st.sidebar:
     st.markdown("""
-    <div style="padding:1.2rem 0 0.5rem 0">
-        <div style="font-family:'Lora',serif;font-size:1.1rem;font-weight:600;color:#e8f4f0;line-height:1.3">
-            Pangkalan Data Tanah
+    <div style="padding:1rem 0 0.5rem">
+        <div style="font-family:'Lora',serif;font-size:1rem;font-weight:600;color:#e8f4f0">
+            Scraper Properti
         </div>
-        <div style="font-size:0.72rem;color:#4ecb8d;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;margin-top:2px">
+        <div style="font-size:0.7rem;color:#4ecb8d;font-weight:600;letter-spacing:0.08em;
+                    text-transform:uppercase;margin-top:2px">
             KJPP Suwendho Rinaldy
         </div>
     </div>
-    <hr style="border:none;border-top:1px solid #1e2d3d;margin:0.8rem 0">
+    <hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">
     """, unsafe_allow_html=True)
 
-    st.markdown('<p style="font-size:0.7rem;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:#4a6a85;margin-bottom:0.3rem">Sumber Data</p>', unsafe_allow_html=True)
-    file = st.file_uploader("Unggah file Excel", type=["xlsx", "xls"], label_visibility="collapsed")
+    st.markdown('<p style="font-size:0.68rem;font-weight:600;letter-spacing:0.1em;'
+                'text-transform:uppercase;color:#4a6a85;margin:0 0 4px 0">Sumber Data</p>',
+                unsafe_allow_html=True)
+    st.markdown('<p style="font-size:0.78rem;color:#7a9ab5;margin:0 0 0.8rem 0">'
+                'rumah123.com — Tanah Dijual</p>', unsafe_allow_html=True)
 
-    st.markdown("<hr style='border:none;border-top:1px solid #1e2d3d;margin:1rem 0'>", unsafe_allow_html=True)
+    st.markdown('<hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">',
+                unsafe_allow_html=True)
 
-    if file and "last_file" in st.session_state and st.session_state["last_file"] != file.name:
-        st.session_state["tampilkan"] = False
-    if file:
-        st.session_state["last_file"] = file.name
+    st.markdown('<p style="font-size:0.68rem;font-weight:600;letter-spacing:0.1em;'
+                'text-transform:uppercase;color:#4a6a85;margin:0 0 6px 0">Filter Lokasi</p>',
+                unsafe_allow_html=True)
 
-    if not file:
-        st.markdown('<p style="font-size:0.78rem;color:#4a6a85;line-height:1.6">Unggah file Excel yang dihasilkan dari <b style="color:#7a9ab5">agregatordata v2</b> untuk memulai.</p>', unsafe_allow_html=True)
-        st.stop()
-
-    file_bytes = file.read()
-    df = load_data(file_bytes, file.name)
-    df["Tahun_Bersih"] = df["Tahun"].apply(bersihkan_tahun)
-
-    st.markdown('<p style="font-size:0.7rem;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:#4a6a85;margin-bottom:0.5rem">Filter Wilayah</p>', unsafe_allow_html=True)
-
-    # ---- Helper: ambil opsi unik bersih dari kolom ----
-    def get_options(series, all_label):
-        opts = sorted([str(v) for v in series.dropna().unique() if str(v).strip() not in ("", "nan")])
-        return [all_label] + opts
-
-    # ---- FILTER 1: Propinsi (dari seluruh data) ----
-    st.markdown('<p style="font-size:0.68rem;color:#4a6a85;margin:0 0 2px 0">Propinsi</p>', unsafe_allow_html=True)
-    prov_options = get_options(df["Propinsi"], "Semua Propinsi")
-    selected_prov = st.selectbox("Propinsi", prov_options, label_visibility="collapsed", key="sel_prov")
-
-    # ---- Scope setelah filter Propinsi ----
-    df_after_prov = df if selected_prov == "Semua Propinsi" else \
-        df[df["Propinsi"].astype(str).str.strip().str.lower() == selected_prov.lower()]
-
-    # ---- FILTER 2: Kota (cascading dari Propinsi) ----
-    st.markdown('<p style="font-size:0.68rem;color:#4a6a85;margin:4px 0 2px 0">Kota / Kabupaten</p>', unsafe_allow_html=True)
-    kota_options = get_options(df_after_prov["Kota"], "Semua Kota")
-    # Reset Kota jika opsi yang dipilih sebelumnya tidak ada di list baru
-    if st.session_state.get("sel_kota", "Semua Kota") not in kota_options:
-        st.session_state["sel_kota"] = "Semua Kota"
-    selected_city = st.selectbox("Kota", kota_options, label_visibility="collapsed", key="sel_kota")
-
-    # ---- Scope setelah filter Kota ----
-    df_after_kota = df_after_prov if selected_city == "Semua Kota" else \
-        df_after_prov[df_after_prov["Kota"].astype(str).str.strip().str.lower() == selected_city.lower()]
-
-    # ---- FILTER 3: Kecamatan (cascading dari Kota) ----
-    st.markdown('<p style="font-size:0.68rem;color:#4a6a85;margin:4px 0 2px 0">Kecamatan</p>', unsafe_allow_html=True)
-    kec_options = get_options(df_after_kota["Kecamatan"], "Semua Kecamatan")
-    if st.session_state.get("sel_kec", "Semua Kecamatan") not in kec_options:
-        st.session_state["sel_kec"] = "Semua Kecamatan"
-    selected_kec = st.selectbox("Kecamatan", kec_options, label_visibility="collapsed", key="sel_kec")
-
-    # ---- Scope setelah filter Kecamatan ----
-    df_after_kec = df_after_kota if selected_kec == "Semua Kecamatan" else \
-        df_after_kota[df_after_kota["Kecamatan"].astype(str).str.strip().str.lower() == selected_kec.lower()]
-
-    # ---- FILTER 4: Kelurahan/Desa (cascading dari Kecamatan) ----
-    st.markdown('<p style="font-size:0.68rem;color:#4a6a85;margin:4px 0 2px 0">Kelurahan / Desa</p>', unsafe_allow_html=True)
-    kel_options = get_options(df_after_kec["Kelurahan"], "Semua Kelurahan")
-    if st.session_state.get("sel_kel", "Semua Kelurahan") not in kel_options:
-        st.session_state["sel_kel"] = "Semua Kelurahan"
-    selected_kel = st.selectbox("Kelurahan", kel_options, label_visibility="collapsed", key="sel_kel")
-
-    st.markdown("<hr style='border:none;border-top:1px solid #1e2d3d;margin:0.8rem 0'>", unsafe_allow_html=True)
-
-    # ---- FILTER 5: Tahun (independen, tidak cascading) ----
-    st.markdown('<p style="font-size:0.68rem;color:#4a6a85;margin:0 0 2px 0">Tahun Data</p>', unsafe_allow_html=True)
-    available_years = sorted([int(y) for y in df["Tahun_Bersih"].dropna().unique()], reverse=True)
-    selected_year = st.selectbox("Tahun", ["Semua Tahun"] + [str(t) for t in available_years],
-                                 label_visibility="collapsed", key="sel_tahun")
-
-    st.markdown("<hr style='border:none;border-top:1px solid #1e2d3d;margin:0.8rem 0'>", unsafe_allow_html=True)
-
-    if "tampilkan" not in st.session_state:
-        st.session_state["tampilkan"] = False
-
-    if st.button("Tampilkan Data", type="primary"):
-        st.session_state["tampilkan"] = True
-
-    if not st.session_state["tampilkan"]:
-        st.stop()
-
-# ==========================================
-# FILTERING
-# ==========================================
-filtered = df.copy()
-
-# Propinsi
-if selected_prov != "Semua Propinsi":
-    filtered = filtered[filtered["Propinsi"].astype(str).str.strip().str.lower() == selected_prov.lower()]
-
-# Kota
-if selected_city != "Semua Kota":
-    filtered = filtered[filtered["Kota"].astype(str).str.strip().str.lower() == selected_city.lower()]
-
-# Kecamatan
-if selected_kec != "Semua Kecamatan":
-    filtered = filtered[filtered["Kecamatan"].astype(str).str.strip().str.lower() == selected_kec.lower()]
-
-# Kelurahan / Desa
-if selected_kel != "Semua Kelurahan":
-    filtered = filtered[filtered["Kelurahan"].astype(str).str.strip().str.lower() == selected_kel.lower()]
-
-# Tahun
-if selected_year != "Semua Tahun":
-    filtered = filtered[filtered["Tahun_Bersih"] == int(selected_year)]
-
-valid_harga = filtered[filtered["Harga_Tanah"] > 0]["Harga_Tanah"]
-
-# ==========================================
-# HEADER
-# ==========================================
-# Bangun label lokasi dari filter yang aktif (dari yang paling luas ke paling sempit)
-_loc_parts = []
-if selected_prov  != "Semua Propinsi":  _loc_parts.append(selected_prov)
-if selected_city  != "Semua Kota":      _loc_parts.append(selected_city)
-if selected_kec   != "Semua Kecamatan": _loc_parts.append(f"Kec. {selected_kec}")
-if selected_kel   != "Semua Kelurahan": _loc_parts.append(f"Kel. {selected_kel}")
-location_label = " › ".join(_loc_parts) if _loc_parts else "Seluruh Wilayah"
-year_label     = selected_year if selected_year != "Semua Tahun" else "Semua Tahun"
-
-st.markdown(f"""
-<div class="main-header">
-    <div class="header-badge">Sistem Informasi Penilaian Properti</div>
-    <h1>Pangkalan Data Tanah</h1>
-    <p>KJPP Suwendho Rinaldy dan Rekan &nbsp;·&nbsp; {location_label} &nbsp;·&nbsp; {year_label}</p>
-</div>
-""", unsafe_allow_html=True)
-
-# ==========================================
-# METRIC CARDS
-# ==========================================
-total_data   = len(filtered)
-total_kota   = filtered["Kota"].nunique()
-valid_coords = filtered.dropna(subset=["Latitude", "Longitude"])
-rata2        = valid_harga.mean() if not valid_harga.empty else 0
-
-st.markdown(f"""
-<div class="metric-grid">
-    <div class="metric-card green">
-        <div class="metric-label">Total Data</div>
-        <div class="metric-value">{total_data:,}</div>
-        <div class="metric-sub">record tersedia</div>
-    </div>
-    <div class="metric-card blue">
-        <div class="metric-label">Kota / Kab.</div>
-        <div class="metric-value">{total_kota}</div>
-        <div class="metric-sub">wilayah tercakup</div>
-    </div>
-    <div class="metric-card amber">
-        <div class="metric-label">Terplot di Peta</div>
-        <div class="metric-value">{len(valid_coords)}</div>
-        <div class="metric-sub">memiliki koordinat</div>
-    </div>
-    <div class="metric-card coral">
-        <div class="metric-label">Rata-rata Harga</div>
-        <div class="metric-value" style="font-size:1.1rem">{format_currency_short(rata2)}</div>
-        <div class="metric-sub">per m² (data valid)</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# ==========================================
-# TABS
-# ==========================================
-tab_peta, tab_tabel, tab_statistik = st.tabs(["🗺️  Peta Lokasi", "📋  Tabel Data", "📊  Statistik Harga"])
-
-# --- TAB 1: PETA ---
-with tab_peta:
-    lat_c, lon_c = -2.548926, 118.0148634
-    m = folium.Map(
-        location=[lat_c, lon_c],
-        zoom_start=5, min_zoom=4, max_zoom=18,
-        prefer_canvas=True,
-        tiles=None
+    kota_pilihan = st.selectbox(
+        "Kota", list(KOTA_SLUG.keys()),
+        label_visibility="collapsed",
+        help="Pilih kota target scraping"
     )
 
-    folium.TileLayer('OpenStreetMap', name='OpenStreetMap').add_to(m)
-    folium.TileLayer(
-        tiles='https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-        name='Voyager', attr='©OpenStreetMap ©CartoDB'
-    ).add_to(m)
-    folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        name='Satellite', attr='Tiles © Esri'
-    ).add_to(m)
+    kecamatan_input = st.text_input(
+        "Kecamatan (opsional)",
+        placeholder="Cth: Coblong, Buah Batu",
+        label_visibility="collapsed",
+        help="Isi untuk mempersempit hasil ke kecamatan tertentu"
+    )
 
-    if not valid_coords.empty:
-        min_lat = valid_coords["Latitude"].min()
-        max_lat = valid_coords["Latitude"].max()
-        min_lon = valid_coords["Longitude"].min()
-        max_lon = valid_coords["Longitude"].max()
-        m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
+    st.markdown('<hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">',
+                unsafe_allow_html=True)
 
-        for r in valid_coords.itertuples():
-            tahun  = getattr(r, "Tahun", 0)
-            nomor  = str(getattr(r, "Nomor", "")).strip()
-            warna  = get_color_by_year(tahun)
-            warna_teks = "red" if "obyek penilaian" in nomor.lower() else warna
-            foto_link  = getattr(r, "Foto", "#")
-            foto_link  = foto_link if pd.notna(foto_link) and str(foto_link) != "nan" else "#"
+    st.markdown('<p style="font-size:0.68rem;font-weight:600;letter-spacing:0.1em;'
+                'text-transform:uppercase;color:#4a6a85;margin:0 0 6px 0">Opsi Scraping</p>',
+                unsafe_allow_html=True)
 
-            popup   = f"<a href='{generate_streetview_url(r.Latitude, r.Longitude)}' target='_blank'>🔍 Lihat Street View</a>"
-            tooltip = (
-                f"<b>Data {r.Nomor}</b><br>"
-                f"<b>{getattr(r, 'Kontak', '-')}</b> · {getattr(r, 'Telp', '-')}<br>"
-                f"Tahun: {tahun} · Alamat: {getattr(r, 'Alamat', '-')}<br>"
-                f"Kel. {getattr(r, 'Kelurahan', '-')}, Kec. {getattr(r, 'Kecamatan', '-')}, {getattr(r, 'Kota', '-')}<br>"
-                f"Luas Tanah: {getattr(r, 'Luas_Tanah', 0)} m² | Bangunan: {getattr(r, 'Luas_Bangunan', 0)} m²<br>"
-                f"<b>Harga: {format_currency(r.Harga_Tanah)}/m²</b>"
-            )
+    jeda_min = st.slider("Jeda min (detik)", 1, 10, 3,
+                         help="Jeda minimum antar request — hindari terlalu cepat")
+    jeda_max = st.slider("Jeda max (detik)", jeda_min, 15, 7)
 
-            folium.Marker(
-                location=[r.Latitude, r.Longitude],
-                popup=popup, tooltip=tooltip,
-                icon=folium.Icon(color=warna)
-            ).add_to(m)
+    st.markdown('<hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">',
+                unsafe_allow_html=True)
 
-            folium.map.Marker(
-                [r.Latitude, r.Longitude],
-                icon=folium.DivIcon(
-                    html=f"""
-                    <div style='font-size:11px;color:{warna_teks};font-weight:700;
-                                font-family:Plus Jakarta Sans,sans-serif;
-                                text-shadow:1px 1px 0 white,-1px -1px 0 white,1px -1px 0 white,-1px 1px 0 white;
-                                background:rgba(255,255,255,0.75);padding:2px 5px;
-                                border-radius:5px;white-space:nowrap;
-                                border:1px solid rgba(0,0,0,0.08)'>
-                        {format_currency(r.Harga_Tanah)}/m²
-                        <br><a href="{foto_link}" target="_blank"
-                              style="color:{warna_teks};text-decoration:underline;font-size:10px">
-                            #{nomor}
-                        </a>
-                    </div>"""
-                )
-            ).add_to(m)
+    st.markdown('<p style="font-size:0.68rem;font-weight:600;letter-spacing:0.1em;'
+                'text-transform:uppercase;color:#4a6a85;margin:0 0 6px 0">'
+                'Cek Duplikat (Opsional)</p>', unsafe_allow_html=True)
+    file_existing = st.file_uploader(
+        "Upload Master Excel existing",
+        type=["xlsx", "xls"],
+        label_visibility="collapsed",
+        help="Upload file hasil scraping sebelumnya untuk cek duplikat"
+    )
 
-    folium.LayerControl(collapsed=False).add_to(m)
-    st_folium(m, use_container_width=True, height=680, returned_objects=[])
+    st.markdown('<hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">',
+                unsafe_allow_html=True)
+    tombol_scrape = st.button("🔍  Mulai Scraping", type="primary")
 
-# --- TAB 2: TABEL ---
-with tab_tabel:
-    st.markdown(f'<div class="result-badge">✓ {len(filtered)} record ditampilkan</div>', unsafe_allow_html=True)
+# --- HEADER ---
+st.markdown(f"""
+<div class="page-header">
+    <div class="badge">Prototipe v1.0 — 1 Halaman</div>
+    <h1>Scraper Data Tanah</h1>
+    <p>Sumber: rumah123.com &nbsp;·&nbsp; Parser: __NEXT_DATA__ JSON &nbsp;·&nbsp;
+       Target: {kota_pilihan}{" — " + kecamatan_input if kecamatan_input else ""}</p>
+</div>
+""", unsafe_allow_html=True)
 
-    display_df = filtered.drop(columns=["Tahun_Bersih"], errors="ignore")
+# --- PANDUAN ---
+with st.expander("ℹ️ Cara kerja & catatan penting", expanded=False):
+    st.markdown("""
+    **Strategi parsing**
+    Rumah123 menggunakan Next.js dengan Server-Side Rendering. Data listing tersimpan di
+    tag `<script id="__NEXT_DATA__">` dalam format JSON — lebih andal dari CSS selector
+    yang bisa berubah kapan saja saat situs diupdate.
 
-    col_fmt = {}
-    if "Harga_Total" in display_df.columns:
-        col_fmt["Harga_Total"] = "{:,.0f}"
-    if "Harga_Tanah" in display_df.columns:
-        col_fmt["Harga_Tanah"] = "{:,.0f}"
+    **Langkah prototipe ini**
+    1. Ambil HTML halaman 1 dengan `httpx`
+    2. Ekstrak JSON dari `__NEXT_DATA__`
+    3. Cari array listing di dalam struktur JSON secara rekursif
+    4. Map field ke kolom Pangkalandata (Luas, Harga, Lokasi, Koordinat, Kontak)
+    5. Cek duplikat vs file existing (jika diupload)
+    6. Tampilkan hasil + tombol download Excel
 
+    **Keterbatasan prototipe**
+    - Hanya 1 halaman (±25 listing) — cukup untuk validasi field mapper
+    - Belum ada pagination ke halaman 2, 3, dst
+    - Jika `__NEXT_DATA__` tidak ditemukan, kemungkinan butuh Playwright (browser headless)
+
+    **Kolom output kompatibel dengan Pangkalandata8.py**
+    Hasil download bisa langsung diupload ke Pangkalandata untuk melihat peta & statistik.
+    """)
+
+# --- LOAD EXISTING DATA ---
+df_existing = pd.DataFrame()
+if file_existing:
+    try:
+        df_existing = pd.read_excel(file_existing)
+        st.markdown(f'<div class="ok-box">✓ File existing dimuat: '
+                    f'<b>{len(df_existing)}</b> baris sebagai referensi duplikat.</div>',
+                    unsafe_allow_html=True)
+    except Exception as e:
+        st.markdown(f'<div class="warn-box">⚠ Gagal membaca file existing: {e}</div>',
+                    unsafe_allow_html=True)
+
+# --- PROSES SCRAPING ---
+if tombol_scrape:
+    st.markdown("---")
+
+    with st.spinner(f"Mengambil data dari rumah123.com — {kota_pilihan}..."):
+        records, status_msg, debug_info = scrape_satu_halaman(
+            kota_nama=kota_pilihan,
+            kecamatan_filter=kecamatan_input,
+            page=1,
+            delay_min=jeda_min,
+            delay_max=jeda_max,
+        )
+
+    # --- STATUS HASIL FETCH ---
+    if not records:
+        st.error(f"Scraping gagal: {status_msg}")
+
+        st.markdown("**Debug info:**")
+        st.json(debug_info)
+
+        st.markdown("""
+        <div class="warn-box">
+        <b>Kemungkinan penyebab & solusi:</b><br>
+        1. <b>__NEXT_DATA__ tidak ada</b> → Halaman ini di-render via CSR.
+           Solusi: ganti ke Playwright (tambahkan <code>playwright</code> di requirements.txt
+           dan <code>chromium-browser</code> di packages.txt).<br>
+        2. <b>HTTP 403</b> → IP Streamlit Cloud sedang diblokir sementara.
+           Solusi: tunggu beberapa menit lalu coba lagi, atau tambahkan proxy.<br>
+        3. <b>Struktur JSON berubah</b> → rumah123 update layout.
+           Solusi: inspeksi <code>sample_json</code> di debug info di atas dan
+           update fungsi <code>find_listings_in_json()</code>.
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+    df_hasil = pd.DataFrame(records)
+    # Pastikan semua kolom output ada
+    for kol in KOLOM_OUTPUT:
+        if kol not in df_hasil.columns:
+            df_hasil[kol] = ""
+    df_hasil = df_hasil[KOLOM_OUTPUT]
+
+    # --- CEK DUPLIKAT ---
+    jumlah_duplikat = 0
+    if not df_existing.empty:
+        df_hasil, jumlah_duplikat = cek_dan_hapus_duplikat(df_hasil, df_existing)
+
+    # --- METRIC CARDS ---
+    total_raw    = len(records)
+    total_bersih = len(df_hasil)
+    valid_coords = df_hasil.dropna(subset=["Latitude", "Longitude"])
+    valid_harga  = df_hasil[df_hasil["Harga_Total"] > 0]["Harga_Total"]
+    rata2_harga  = valid_harga.mean() if not valid_harga.empty else 0
+
+    def fmt_harga(v):
+        if v >= 1e9:
+            return f"Rp {v/1e9:.1f}M"
+        elif v >= 1e6:
+            return f"Rp {v/1e6:.0f}jt"
+        return f"Rp {v:,.0f}"
+
+    st.markdown(f"""
+    <div class="stat-row">
+        <div class="stat-box g">
+            <div class="lbl">Total Ditemukan</div>
+            <div class="val">{total_raw}</div>
+            <div class="sub">listing di halaman 1</div>
+        </div>
+        <div class="stat-box b">
+            <div class="lbl">Data Baru</div>
+            <div class="val">{total_bersih}</div>
+            <div class="sub">{jumlah_duplikat} duplikat dibuang</div>
+        </div>
+        <div class="stat-box a">
+            <div class="lbl">Ada Koordinat</div>
+            <div class="val">{len(valid_coords)}</div>
+            <div class="sub">siap diplot di peta</div>
+        </div>
+        <div class="stat-box r">
+            <div class="lbl">Rata-rata Harga</div>
+            <div class="val" style="font-size:1.1rem">{fmt_harga(rata2_harga)}</div>
+            <div class="sub">per unit (bukan /m²)</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # --- STATUS PARSING ---
+    st.markdown(f'<div class="ok-box">✓ {status_msg} &nbsp;·&nbsp; '
+                f'URL: <code>{debug_info.get("url","")}</code></div>',
+                unsafe_allow_html=True)
+
+    # --- TABEL HASIL ---
+    st.markdown("#### Hasil Scraping")
+    kolom_tampil = ["Nomor", "Judul_Iklan", "Kecamatan", "Kota",
+                    "Luas_Tanah", "Harga_Total", "Harga_Tanah",
+                    "Bukti_Kepemilikan", "Latitude", "Longitude",
+                    "Kontak", "Agen"]
+    kolom_ada = [c for c in kolom_tampil if c in df_hasil.columns]
     st.dataframe(
-        display_df,
+        df_hasil[kolom_ada],
         use_container_width=True,
-        height=520,
+        height=420,
         column_config={
-            "Harga_Total": st.column_config.NumberColumn("Harga Total (Rp)", format="%d"),
-            "Harga_Tanah": st.column_config.NumberColumn("Harga Tanah /m² (Rp)", format="%d"),
-            "Luas_Tanah":  st.column_config.NumberColumn("Luas Tanah (m²)", format="%.1f"),
-            "Luas_Bangunan": st.column_config.NumberColumn("Luas Bangunan (m²)", format="%.1f"),
-            "Latitude":    st.column_config.NumberColumn("Latitude", format="%.6f"),
-            "Longitude":   st.column_config.NumberColumn("Longitude", format="%.6f"),
+            "Harga_Total":  st.column_config.NumberColumn("Harga Total (Rp)", format="%d"),
+            "Harga_Tanah":  st.column_config.NumberColumn("Harga /m² (Rp)", format="%d"),
+            "Luas_Tanah":   st.column_config.NumberColumn("Luas Tanah (m²)", format="%.1f"),
+            "Latitude":     st.column_config.NumberColumn(format="%.6f"),
+            "Longitude":    st.column_config.NumberColumn(format="%.6f"),
         }
     )
 
-    csv_data = display_df.to_csv(index=False).encode("utf-8")
+    # --- DOWNLOAD ---
+    nama_file = (
+        f"scraping_{kota_pilihan.lower().replace(' ','_')}"
+        f"{'_' + kecamatan_input.replace(' ','_') if kecamatan_input else ''}"
+        f"_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    )
+    excel_bytes = to_excel_bytes(df_hasil)
+
     st.download_button(
-        "⬇  Download CSV",
-        data=csv_data,
-        file_name=f"data_tanah_{selected_city.replace(' ','_')}_{selected_year}.csv",
-        mime="text/csv"
+        label="⬇  Download Excel",
+        data=excel_bytes,
+        file_name=nama_file,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
     )
 
-# --- TAB 3: STATISTIK ---
-with tab_statistik:
-    if valid_harga.empty:
-        st.info("Tidak ada data harga valid untuk filter yang dipilih.")
-    else:
-        harga_min  = valid_harga.min()
-        harga_max  = valid_harga.max()
-        harga_mean = valid_harga.mean()
-        harga_med  = valid_harga.median()
-        std_dev    = valid_harga.std()
-        count_harga = len(valid_harga)
+    st.caption(
+        "File Excel ini kompatibel langsung dengan **Pangkalandata8.py** — "
+        "upload file ini di Pangkalandata untuk melihat peta dan statistik harga."
+    )
 
-        # --- Kartu Harga Utama ---
-        st.markdown('<div class="stat-section-title">Ringkasan Harga Tanah per m²</div>', unsafe_allow_html=True)
-        st.markdown(f"""
-        <div class="stat-grid">
-            <div class="stat-card">
-                <div class="stat-icon">📉</div>
-                <div class="stat-label">Harga Terendah</div>
-                <div class="stat-value coral">{format_currency_short(harga_min)}</div>
-                <div class="stat-sub">per m²</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">⚖️</div>
-                <div class="stat-label">Rata-rata</div>
-                <div class="stat-value blue">{format_currency_short(harga_mean)}</div>
-                <div class="stat-sub">mean · median {format_currency_short(harga_med)}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">📈</div>
-                <div class="stat-label">Harga Tertinggi</div>
-                <div class="stat-value green">{format_currency_short(harga_max)}</div>
-                <div class="stat-sub">per m²</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # --- Kartu Metrik Tambahan ---
-        spread_pct = ((harga_max - harga_min) / harga_mean * 100) if harga_mean > 0 else 0
-        cv = (std_dev / harga_mean * 100) if harga_mean > 0 else 0
-
-        st.markdown(f"""
-        <div class="metric-grid" style="grid-template-columns:repeat(4,1fr)">
-            <div class="metric-card blue">
-                <div class="metric-label">Jumlah Data</div>
-                <div class="metric-value">{count_harga:,}</div>
-                <div class="metric-sub">data harga valid</div>
-            </div>
-            <div class="metric-card green">
-                <div class="metric-label">Median</div>
-                <div class="metric-value" style="font-size:1.1rem">{format_currency_short(harga_med)}</div>
-                <div class="metric-sub">nilai tengah</div>
-            </div>
-            <div class="metric-card amber">
-                <div class="metric-label">Std. Deviasi</div>
-                <div class="metric-value" style="font-size:1.1rem">{format_currency_short(std_dev)}</div>
-                <div class="metric-sub">dispersi harga</div>
-            </div>
-            <div class="metric-card coral">
-                <div class="metric-label">Koef. Variasi</div>
-                <div class="metric-value">{cv:.1f}%</div>
-                <div class="metric-sub">homogenitas data</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # --- Bar Chart Rata-rata per Kota ---
-        st.markdown('<div class="stat-section-title">Rata-rata Harga per Kota (Top 10)</div>', unsafe_allow_html=True)
-
-        kota_stat = (
-            filtered[filtered["Harga_Tanah"] > 0]
-            .groupby("Kota")["Harga_Tanah"]
-            .mean()
-            .reset_index()
-            .rename(columns={"Harga_Tanah": "Rata2_Harga"})
-            .sort_values("Rata2_Harga", ascending=False)
-            .head(10)
-        )
-
-        bar_html = build_bar_chart_html(kota_stat, "Kota", "Rata2_Harga")
-        st.markdown(f'<div style="background:#fff;border:1px solid #e8ecf0;border-radius:14px;padding:1.4rem 1.5rem">{bar_html}</div>', unsafe_allow_html=True)
-
-        # --- Bar Chart Rata-rata per Tahun ---
-        st.markdown('<div class="stat-section-title">Tren Rata-rata Harga per Tahun</div>', unsafe_allow_html=True)
-
-        tahun_stat = (
-            filtered[filtered["Harga_Tanah"] > 0]
-            .groupby("Tahun_Bersih")["Harga_Tanah"]
-            .agg(["mean", "count"])
-            .reset_index()
-            .rename(columns={"Tahun_Bersih": "Tahun", "mean": "Rata2_Harga", "count": "Jumlah"})
-            .sort_values("Tahun")
-        )
-
-        bar_html2 = build_bar_chart_html(tahun_stat, "Tahun", "Rata2_Harga")
-        col_a, col_b = st.columns([2, 1])
-        with col_a:
-            st.markdown(f'<div style="background:#fff;border:1px solid #e8ecf0;border-radius:14px;padding:1.4rem 1.5rem">{bar_html2}</div>', unsafe_allow_html=True)
-        with col_b:
-            st.markdown('<div style="background:#fff;border:1px solid #e8ecf0;border-radius:14px;padding:1.4rem 1.5rem">', unsafe_allow_html=True)
-            st.markdown('<div class="stat-section-title" style="margin-top:0">Jumlah Data per Tahun</div>', unsafe_allow_html=True)
-            tabel_tahun = tahun_stat[["Tahun", "Jumlah", "Rata2_Harga"]].copy()
-            tabel_tahun["Rata2_Harga"] = tabel_tahun["Rata2_Harga"].apply(format_currency_short)
-            st.dataframe(
-                tabel_tahun.rename(columns={"Rata2_Harga": "Rata-rata /m²"}),
-                use_container_width=True,
-                hide_index=True
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        # --- Distribusi Rentang Harga ---
-        st.markdown('<div class="stat-section-title">Distribusi Rentang Harga</div>', unsafe_allow_html=True)
-
-        bins   = [0, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000, float('inf')]
-        labels = ["< 500 rb", "500rb–1 jt", "1–2 jt", "2–5 jt", "5–10 jt", "> 10 jt"]
-        dist   = pd.cut(valid_harga, bins=bins, labels=labels).value_counts().sort_index().reset_index()
-        dist.columns = ["Rentang", "Jumlah"]
-        dist["Persen"] = (dist["Jumlah"] / dist["Jumlah"].sum() * 100).round(1)
-
-        dist_html = ""
-        max_j = dist["Jumlah"].max() if dist["Jumlah"].max() > 0 else 1
-        for _, row in dist.iterrows():
-            pct_bar = (row["Jumlah"] / max_j) * 100
-            dist_html += f"""
-            <div class="bar-row">
-                <span class="bar-label" style="min-width:90px">{row['Rentang']}</span>
-                <div class="bar-track"><div class="bar-fill" style="width:{pct_bar:.1f}%;background:linear-gradient(90deg,#1a5c8b,#4eaacb)"></div></div>
-                <span class="bar-val">{int(row['Jumlah'])} data &nbsp;<span style="color:#9aabb8">({row['Persen']}%)</span></span>
-            </div>"""
-
-        st.markdown(f'<div style="background:#fff;border:1px solid #e8ecf0;border-radius:14px;padding:1.4rem 1.5rem">{dist_html}</div>', unsafe_allow_html=True)
-
-        st.markdown("""
-        <div style="margin-top:1rem;padding:0.8rem 1rem;background:#f0f9f5;border:1px solid #a8dfca;border-radius:10px;font-size:0.78rem;color:#2a6b4a;line-height:1.7">
-        <b>Catatan metodologi:</b> Statistik dihitung dari data dengan <code>Harga_Tanah > 0</code>.
-        Koefisien Variasi (KV) mengukur homogenitas: KV &lt; 15% = homogen, 15–30% = cukup homogen, &gt; 30% = heterogen.
-        Nilai median digunakan sebagai indikator sentral yang lebih robust terhadap outlier.
-        </div>
-        """, unsafe_allow_html=True)
+    # --- DEBUG EXPANDER ---
+    with st.expander("🔧 Debug info (untuk developer)", expanded=False):
+        st.json(debug_info)
+        if not df_hasil.empty:
+            st.markdown("**Sampel record pertama (raw):**")
+            st.json(df_hasil.iloc[0].to_dict())
