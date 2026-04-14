@@ -18,3 +18,5 @@ streamlit-folium>=0.15.0
 
 # Framework
 streamlit>=1.28.0
+
+playwright
