@@ -75,17 +75,61 @@ KOTA_SLUG = {
     "Denpasar":         "denpasar",
 }
 
-# Header HTTP — menyerupai browser biasa untuk menghindari blokir awal
+# Header HTTP lengkap — menyerupai Chrome nyata di Windows sedetail mungkin.
+# Rumah123 memeriksa kombinasi header, bukan hanya User-Agent.
+# Urutan header juga penting — browser selalu mengirim dalam urutan tertentu.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.google.com/",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;"
+        "q=0.8,application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language":  "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Connection":       "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest":   "document",
+    "Sec-Fetch-Mode":   "navigate",
+    "Sec-Fetch-Site":   "none",
+    "Sec-Fetch-User":   "?1",
+    "Sec-Ch-Ua":        '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Cache-Control":    "max-age=0",
+    "Referer":          "https://www.google.co.id/",
 }
+
+# ScraperAPI — proxy residensial gratis 1.000 req/bulan
+# Daftar di: https://www.scraperapi.com (pilih Free plan)
+# Cara kerja: request dikirim ke api.scraperapi.com dengan URL target sebagai parameter,
+# ScraperAPI meneruskan dari IP residential yang tidak dikenali sebagai bot.
+SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com"
+
+def build_fetch_url(target_url: str, api_key: str) -> tuple[str, dict]:
+    """
+    Jika api_key diisi  → gunakan ScraperAPI sebagai proxy.
+                          Menambahkan parameter render=false (HTML statis, lebih cepat)
+                          dan country_code=id (IP Indonesia, relevan untuk rumah123).
+    Jika api_key kosong → request langsung ke target (mungkin 403 dari cloud).
+
+    Mengembalikan (url_final, extra_params) yang siap dipakai requests.get().
+    """
+    if api_key and api_key.strip():
+        params = {
+            "api_key":     api_key.strip(),
+            "url":         target_url,
+            "render":      "false",   # false = lebih cepat, cukup untuk SSR/Next.js
+            "country_code": "id",     # IP dari Indonesia
+            "keep_headers": "true",   # teruskan HEADERS kita ke target
+        }
+        return SCRAPERAPI_ENDPOINT, params
+    else:
+        return target_url, {}
 
 # Kolom output — didesain kompatibel dengan Pangkalandata8
 KOLOM_OUTPUT = [
@@ -155,45 +199,58 @@ def hitung_harga_per_m2(harga_total, luas_tanah):
 # CORE: FETCH HALAMAN
 # ==========================================
 
-def fetch_page(url, timeout=20):
+def fetch_page(url, api_key="", timeout=30):
     """
-    Mengambil HTML halaman dengan requests (library standar Python).
-    Mengembalikan (html_text, 200) jika berhasil, atau (None, pesan_error).
+    Mengambil HTML halaman. Mendukung dua mode:
+    - Direct     : request langsung ke rumah123 (mungkin 403 dari Streamlit Cloud)
+    - ScraperAPI : request melalui proxy residensial (bypass 403)
 
-    Menggunakan requests bukan httpx karena:
-    - requests sudah pasti ada di semua Python environment termasuk Streamlit Cloud
-    - httpx sering mengalami dependency conflict saat di-install bersama streamlit
-    - Untuk scraping halaman statis, requests sudah lebih dari cukup
+    Mode ditentukan otomatis berdasarkan ada/tidaknya api_key.
     """
     if _http_lib is None:
         return None, "Library HTTP tidak tersedia — pastikan 'requests' ada di requirements.txt"
 
+    fetch_url, extra_params = build_fetch_url(url, api_key)
+    mode = "ScraperAPI" if extra_params else "Direct"
+
     try:
         session = _http_lib.Session()
         session.headers.update(HEADERS)
+        session.cookies.set("consent",      "true",        domain=".rumah123.com")
+        session.cookies.set("cookieconsent", "accepted",   domain=".rumah123.com")
 
-        # Tambahkan cookie consent standar agar tidak di-redirect
-        session.cookies.set("consent", "true", domain=".rumah123.com")
-
-        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        resp = session.get(
+            fetch_url,
+            params=extra_params if extra_params else None,
+            timeout=timeout,
+            allow_redirects=True,
+        )
 
         if resp.status_code == 200:
             return resp.text, 200
         elif resp.status_code == 403:
-            return None, "403 — Akses ditolak (rate limit atau blokir IP sementara)"
+            if mode == "Direct":
+                return None, (
+                    "403 — IP Streamlit Cloud diblokir rumah123. "
+                    "Masukkan ScraperAPI Key di sidebar untuk bypass."
+                )
+            else:
+                return None, "403 — ScraperAPI juga diblokir (coba ganti country_code atau cek kuota key)"
+        elif resp.status_code == 401:
+            return None, "401 — ScraperAPI Key tidak valid atau kuota habis"
         elif resp.status_code == 404:
             return None, "404 — Halaman tidak ditemukan, cek slug kota"
         elif resp.status_code == 429:
             return None, "429 — Terlalu banyak request, tambah jeda dan coba lagi"
         else:
-            return None, f"HTTP {resp.status_code} — {resp.reason}"
+            return None, f"HTTP {resp.status_code} via {mode}"
 
     except _http_lib.exceptions.Timeout:
-        return None, "Timeout — koneksi terlalu lambat, coba lagi"
+        return None, f"Timeout via {mode} — coba naikkan batas waktu"
     except _http_lib.exceptions.ConnectionError:
-        return None, "Connection error — tidak bisa terhubung ke rumah123.com"
+        return None, f"Connection error via {mode}"
     except Exception as e:
-        return None, f"Error tidak terduga: {str(e)}"
+        return None, f"Error tidak terduga via {mode}: {str(e)}"
 
 
 # ==========================================
@@ -418,7 +475,8 @@ def parse_single_listing(item, kota_filter, idx):
 # CORE: SCRAPE SATU HALAMAN
 # ==========================================
 
-def scrape_satu_halaman(kota_nama, kecamatan_filter="", page=1, delay_min=3, delay_max=7):
+def scrape_satu_halaman(kota_nama, kecamatan_filter="", page=1,
+                        delay_min=3, delay_max=7, api_key=""):
     """
     Mengambil data listing dari satu halaman pencarian.
     Mengembalikan (list_records, status_msg, raw_debug).
@@ -441,7 +499,7 @@ def scrape_satu_halaman(kota_nama, kecamatan_filter="", page=1, delay_min=3, del
         jeda = random.uniform(delay_min, delay_max)
         time.sleep(jeda)
 
-    html, status = fetch_page(full_url)
+    html, status = fetch_page(full_url, api_key=api_key)
 
     if html is None:
         return [], f"Gagal fetch: {status}", {"url": full_url, "error": status}
@@ -672,12 +730,36 @@ with st.sidebar:
 
     st.markdown('<hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">',
                 unsafe_allow_html=True)
+
+    st.markdown(
+        '<p style="font-size:0.68rem;font-weight:600;letter-spacing:0.1em;'
+        'text-transform:uppercase;color:#4a6a85;margin:0 0 4px 0">'
+        'ScraperAPI Key</p>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<p style="font-size:0.72rem;color:#4a6a85;line-height:1.5;margin:0 0 6px 0">'
+        'Wajib diisi jika dijalankan dari Streamlit Cloud. '
+        'Daftar gratis di <b style="color:#7a9ab5">scraperapi.com</b> '
+        '(1.000 req/bulan).</p>',
+        unsafe_allow_html=True
+    )
+    scraperapi_key = st.text_input(
+        "ScraperAPI Key",
+        placeholder="Paste API key di sini...",
+        type="password",
+        label_visibility="collapsed",
+        help="Tanpa key: mungkin 403 dari cloud. Dengan key: bypass anti-bot rumah123."
+    )
+
+    st.markdown('<hr style="border:none;border-top:1px solid #1e2d3d;margin:0.7rem 0">',
+                unsafe_allow_html=True)
     tombol_scrape = st.button("🔍  Mulai Scraping", type="primary")
 
 # --- HEADER ---
 st.markdown(f"""
 <div class="page-header">
-    <div class="badge">Prototipe v1.0 — 1 Halaman</div>
+    <div class="badge">Prototipe v1.2 — Fix 403 + ScraperAPI</div>
     <h1>Scraper Data Tanah</h1>
     <p>Sumber: rumah123.com &nbsp;·&nbsp; Parser: __NEXT_DATA__ JSON &nbsp;·&nbsp;
        Target: {kota_pilihan}{" — " + kecamatan_input if kecamatan_input else ""}</p>
@@ -732,6 +814,7 @@ if tombol_scrape:
             page=1,
             delay_min=jeda_min,
             delay_max=jeda_max,
+            api_key=scraperapi_key,
         )
 
     # --- STATUS HASIL FETCH ---
@@ -743,15 +826,16 @@ if tombol_scrape:
 
         st.markdown("""
         <div class="warn-box">
-        <b>Kemungkinan penyebab & solusi:</b><br>
-        1. <b>__NEXT_DATA__ tidak ada</b> → Halaman ini di-render via CSR.
-           Solusi: ganti ke Playwright (tambahkan <code>playwright</code> di requirements.txt
-           dan <code>chromium-browser</code> di packages.txt).<br>
-        2. <b>HTTP 403</b> → IP Streamlit Cloud sedang diblokir sementara.
-           Solusi: tunggu beberapa menit lalu coba lagi, atau tambahkan proxy.<br>
-        3. <b>Struktur JSON berubah</b> → rumah123 update layout.
-           Solusi: inspeksi <code>sample_json</code> di debug info di atas dan
-           update fungsi <code>find_listings_in_json()</code>.
+        <b>Kemungkinan penyebab & solusi:</b><br><br>
+        <b>Error 403 (paling umum dari Streamlit Cloud):</b><br>
+        IP datacenter Streamlit Cloud dikenal sebagai bot oleh rumah123.
+        Solusi: masukkan <b>ScraperAPI Key</b> di sidebar (daftar gratis di
+        <a href="https://www.scraperapi.com" target="_blank">scraperapi.com</a> →
+        1.000 request/bulan gratis, tidak butuh kartu kredit).<br><br>
+        <b>Error lain:</b><br>
+        • <b>__NEXT_DATA__ tidak ditemukan</b> → halaman CSR, perlu Playwright<br>
+        • <b>401 ScraperAPI</b> → key salah atau kuota habis, cek di dashboard scraperapi.com<br>
+        • <b>Struktur JSON berubah</b> → cek <code>sample_json</code> di debug info
         </div>
         """, unsafe_allow_html=True)
         st.stop()
